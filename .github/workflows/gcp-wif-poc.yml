@@ -14,7 +14,7 @@ jobs:
         id: token
         run: |
           TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://iam.googleapis.com/projects/ami-test2-277908/locations/global/workloadIdentityPools/oidc-poc-pool/providers/github-actions" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://iam.googleapis.com/projects/709600609006/locations/global/workloadIdentityPools/oidc-poc-pool/providers/github-actions" \
             | jq -r '.value')
           echo "Got OIDC token (first 20 chars): ${TOKEN:0:20}..."
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
@@ -31,7 +31,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-              "audience": "//iam.googleapis.com/projects/ami-test2-277908/locations/global/workloadIdentityPools/oidc-poc-pool/providers/github-actions",
+              "audience": "//iam.googleapis.com/projects/709600609006/locations/global/workloadIdentityPools/oidc-poc-pool/providers/github-actions",
               "scope": "https://www.googleapis.com/auth/cloud-platform",
               "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
               "subject_token": "${{ steps.token.outputs.token }}",
