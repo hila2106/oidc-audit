@@ -40,13 +40,23 @@ def provider_host_from_principal(statement):
     return None
 
 
+GITHUB_INDIVIDUAL_KEYS = {"repository_owner_id", "repository_id", "job_workflow_ref", "ref", "environment", "actor_id", "runner_environment"}
+
+
 def extract_org_names(sub_values, conditions=None):
-    """Pull org/user names from sub conditions for claimable checking."""
+    """Pull org/user names from sub conditions and standalone owner keys for claimable checking."""
     names = set()
     for sv in sub_values:
         m = re.match(r"repo:([^/]+)/", sv)
         if m:
             names.add(m.group(1))
+    if conditions:
+        for operator, kv in conditions.items():
+            for key, val in (kv or {}).items():
+                if key.endswith(":repository_owner"):
+                    for v in as_list(val):
+                        if v and "*" not in v:
+                            names.add(v)
     return names
 
 
@@ -71,7 +81,7 @@ def check_github_claimable(name):
 
 # --- link 1: the trust policy gate (AWS) ------------------------------------
 
-def analyze_trust_policy(trust_doc, want_host, check_claimable=False):
+def analyze_trust_policy(trust_doc, want_host, check_claimable=False, pedantic=False):
     findings = []
     matched = False
 
@@ -96,6 +106,7 @@ def analyze_trust_policy(trust_doc, want_host, check_claimable=False):
         sub_values = []
         all_keys = set()
         uses_set_operator = False
+        uses_string_like_sub = False
         for operator, kv in conditions.items():
             if operator.startswith(("ForAllValues:", "ForAnyValue:")):
                 uses_set_operator = True
@@ -103,14 +114,27 @@ def analyze_trust_policy(trust_doc, want_host, check_claimable=False):
                 all_keys.add(key)
                 if key == sub_key:
                     sub_values.extend(as_list(val))
+                    if "Like" in operator:
+                        uses_string_like_sub = True
 
-        if not any(k == sub_key for k in all_keys):
+        individual_keys_present = set()
+        if want_host == PROVIDERS["github"]:
+            for k in all_keys:
+                suffix = k.split(":")[-1] if ":" in k else ""
+                if suffix in GITHUB_INDIVIDUAL_KEYS:
+                    individual_keys_present.add(suffix)
+
+        has_sub = any(k == sub_key for k in all_keys)
+        has_owner_restriction = bool(individual_keys_present & {"repository_owner_id", "repository_id", "job_workflow_ref"})
+
+        if not has_sub and not has_owner_restriction:
             findings.append({
                 "id": "missing_sub",
                 "severity": "critical",
-                "detail": "No sub condition. Any workflow on this provider can assume the role.",
+                "detail": "No sub condition and no individual scope keys (repository_owner_id, repository_id, job_workflow_ref). Any workflow on this provider can assume the role.",
             })
-        else:
+
+        if has_sub:
             for sv in sub_values:
                 if re.match(r"^repo:[^/]+/\*$", sv):
                     findings.append({
@@ -143,14 +167,14 @@ def analyze_trust_policy(trust_doc, want_host, check_claimable=False):
                         "detail": f"Subject '{sv}' contains a wildcard in a permissive position.",
                     })
 
-            if check_claimable and want_host == PROVIDERS["github"]:
-                for name in extract_org_names(sub_values):
-                    if check_github_claimable(name):
-                        findings.append({
-                            "id": "claimable_owner",
-                            "severity": "critical",
-                            "detail": f"Account '{name}' does not exist on GitHub and can be registered by anyone.",
-                        })
+        if check_claimable and want_host == PROVIDERS["github"]:
+            for name in extract_org_names(sub_values, conditions):
+                if check_github_claimable(name):
+                    findings.append({
+                        "id": "claimable_owner",
+                        "severity": "critical",
+                        "detail": f"Account '{name}' does not exist on GitHub and can be registered by anyone.",
+                    })
 
         if uses_set_operator:
             findings.append({
@@ -166,7 +190,7 @@ def analyze_trust_policy(trust_doc, want_host, check_claimable=False):
                 "detail": "No aud condition.",
             })
 
-        if want_host == PROVIDERS["github"] and owner_id_key not in all_keys:
+        if pedantic and want_host == PROVIDERS["github"] and owner_id_key not in all_keys:
             findings.append({
                 "id": "no_owner_id",
                 "severity": "low",
@@ -205,7 +229,7 @@ def _gcp_rest_get(url, credentials):
         raise RuntimeError(f"GCP API {e.code}: {body}")
 
 
-def analyze_gcp_condition(cond_text, check_claimable=False):
+def analyze_gcp_condition(cond_text, check_claimable=False, pedantic=False):
     """Analyze a GCP provider attribute condition (CEL expression)."""
     findings = []
     if not cond_text or cond_text.strip().lower() in ("true", ""):
@@ -238,7 +262,16 @@ def analyze_gcp_condition(cond_text, check_claimable=False):
             "detail": "No branch or environment restriction. Any branch in the accepted repos can federate.",
         })
 
-    if has_repo_owner and not has_owner_id:
+    for m in re.finditer(r"""startsWith\s*\(\s*["']([^"']+)["']\s*\)""", cond_text):
+        prefix = m.group(1)
+        if not prefix.endswith("/"):
+            findings.append({
+                "id": "starts_with_no_slash",
+                "severity": "critical",
+                "detail": f"startsWith('{prefix}') has no trailing slash — matches any org starting with that prefix (e.g. '{prefix}-evil').",
+            })
+
+    if pedantic and has_repo_owner and not has_owner_id:
         findings.append({
             "id": "name_based_owner",
             "severity": "low",
@@ -258,7 +291,7 @@ def analyze_gcp_condition(cond_text, check_claimable=False):
     return findings
 
 
-def audit_gcp(project_id, check_claimable=False, verbose=False):
+def audit_gcp(project_id, check_claimable=False, verbose=False, pedantic=False):
     """Audit GCP Workload Identity Federation pools in a project."""
     import google.auth
     import google.auth.transport.requests
@@ -290,7 +323,12 @@ def audit_gcp(project_id, check_claimable=False, verbose=False):
         if verbose:
             print(f"  Pool: {pool_short}", file=sys.stderr)
 
-        providers_resp = _gcp_rest_get(f"https://iam.googleapis.com/v1/{pool_name}/providers", credentials)
+        try:
+            providers_resp = _gcp_rest_get(f"https://iam.googleapis.com/v1/{pool_name}/providers", credentials)
+        except RuntimeError:
+            if verbose:
+                print(f"    (skipped — not a standard WIF pool)", file=sys.stderr)
+            continue
         providers = providers_resp.get("workloadIdentityPoolProviders", [])
 
         for prov in providers:
@@ -302,7 +340,7 @@ def audit_gcp(project_id, check_claimable=False, verbose=False):
                 continue
 
             cond = prov.get("attributeCondition", "")
-            cond_findings = analyze_gcp_condition(cond, check_claimable=check_claimable)
+            cond_findings = analyze_gcp_condition(cond, check_claimable=check_claimable, pedantic=pedantic)
 
             if verbose:
                 print(f"    Provider: {prov_short} (GitHub)", file=sys.stderr)
@@ -341,6 +379,7 @@ COLOR = {
     "high": "\033[31m",
     "medium": "\033[33m",
     "low": "\033[36m",
+    "clean": "\033[32m",
     "info": "\033[2m",
     "reset": "\033[0m",
 }
@@ -352,7 +391,7 @@ def colorize(text, label, use_color):
     return f"{COLOR.get(label, '')}{text}{COLOR['reset']}"
 
 
-def print_report(results, use_color):
+def print_report(results, use_color, verbosity="default"):
     if not results:
         print("No OIDC-connected roles/providers found. Nothing to report.")
         return
@@ -369,10 +408,16 @@ def print_report(results, use_color):
     )
     print(f"\n{len(results)} OIDC role(s)   {summary}\n")
 
+    if verbosity == "summary":
+        return
+
     for r in results:
         label = r["score"]["label"]
-        cloud = r.get("cloud", "aws")
 
+        if verbosity == "default" and label == "clean":
+            continue
+
+        cloud = r.get("cloud", "aws")
         if cloud == "gcp":
             header = f"[{label.upper()}] {r['pool']}/{r['provider']}"
         else:
@@ -409,7 +454,8 @@ def audit_aws(args, hosts, host_to_name):
                 trust_doc = role.get("AssumeRolePolicyDocument", {})
                 for host in hosts:
                     matched, findings = analyze_trust_policy(
-                        trust_doc, host, check_claimable=args.check_claimable
+                        trust_doc, host, check_claimable=args.check_claimable,
+                        pedantic=args.pedantic
                     )
                     if not matched:
                         continue
@@ -443,9 +489,12 @@ def main():
                     help="Which OIDC provider to audit (default: github)")
     ap.add_argument("--check-claimable", action="store_true",
                     help="Check GitHub for claimable org/user names (makes API calls to github.com)")
+    ap.add_argument("--pedantic", action="store_true",
+                    help="Include low-severity findings (e.g. name-based owner instead of numeric ID)")
     ap.add_argument("--json", action="store_true", help="Emit JSON instead of a report")
+    ap.add_argument("--summary", action="store_true", help="Show only the summary counts")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI color")
-    ap.add_argument("--verbose", action="store_true", help="Print progress to stderr")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Show all roles including clean, and print progress")
     args = ap.parse_args()
 
     if args.cloud == "gcp":
@@ -455,7 +504,7 @@ def main():
             import google.auth
         except ImportError:
             sys.exit("google-auth is required for GCP mode. Install with:  pip install google-auth")
-        results = audit_gcp(args.project, check_claimable=args.check_claimable, verbose=args.verbose)
+        results = audit_gcp(args.project, check_claimable=args.check_claimable, verbose=args.verbose, pedantic=args.pedantic)
     else:
         try:
             import boto3
@@ -468,7 +517,8 @@ def main():
     if args.json:
         print(json.dumps(results, indent=2, default=str))
     else:
-        print_report(results, use_color=not args.no_color and sys.stdout.isatty())
+        verbosity = "summary" if args.summary else ("verbose" if args.verbose else "default")
+        print_report(results, use_color=not args.no_color and sys.stdout.isatty(), verbosity=verbosity)
 
 
 if __name__ == "__main__":
