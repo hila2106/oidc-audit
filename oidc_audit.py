@@ -142,12 +142,29 @@ def analyze_trust_policy(trust_doc, want_host, check_claimable=False, pedantic=F
                         "severity": "critical",
                         "detail": f"Subject '{sv}' trusts every repo in the org.",
                     })
-                elif re.match(r"^repo:[^/\*]+\*", sv) and "/" not in sv.split("repo:", 1)[1].split("*", 1)[0]:
-                    findings.append({
-                        "id": "org_prefix_no_slash",
-                        "severity": "critical",
-                        "detail": f"Subject '{sv}' has no slash before the wildcard — matches any org starting with that prefix.",
-                    })
+                elif re.match(r"^repo:[^/\*]+\*", sv):
+                    prefix = sv.split("repo:", 1)[1].split("*", 1)[0]
+                    if prefix.endswith("@"):
+                        # GitHub's immutable subject claim format delimits the
+                        # (unrecyclable) numeric owner ID with "@", the same
+                        # role "/" plays for the repo name. A wildcard here
+                        # doesn't let a different org name match, but it does
+                        # accept any owner ID for this name, which defeats the
+                        # anti-namesquatting purpose of the immutable ID: if
+                        # this org name is ever deleted and re-registered by
+                        # someone else, their (different) ID still matches.
+                        # https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/
+                        findings.append({
+                            "id": "immutable_id_wildcarded",
+                            "severity": "high",
+                            "detail": f"Subject '{sv}' pins the org name but wildcards the immutable owner ID — a future org that reclaims this name would still match, defeating GitHub's anti-namesquatting protection.",
+                        })
+                    else:
+                        findings.append({
+                            "id": "org_prefix_no_slash",
+                            "severity": "critical",
+                            "detail": f"Subject '{sv}' has no slash before the wildcard — matches any org starting with that prefix.",
+                        })
                 elif sv.endswith(":*"):
                     findings.append({
                         "id": "subject_wildcard",
